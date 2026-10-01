@@ -4,7 +4,6 @@ from datetime import datetime,timedelta
 from typing import Iterable
 from .timeutil import Window,utc
 from .models import Decision
-
 @dataclass(frozen=True)
 class Bus:
     bus_id:str
@@ -84,6 +83,10 @@ class BusDispatcher:
                 start=req.ready_at
                 for w in sorted(virtual_use[bid],key=lambda x:x.start):
                     if w.start<=start<w.end:start=w.end
+                # A bus with no free wheelchair space cannot pick up a trip
+                # that still has accessible passengers waiting, otherwise the
+                # accessible rider is silently loaded as a standing passenger.
+                if accessible>0 and b.accessible_spaces<=0:continue
                 acc=min(accessible,b.accessible_spaces)
                 cap=b.capacity(acc)
                 if cap<=0:continue
@@ -108,12 +111,22 @@ class BusDispatcher:
             return ShuttlePlan(req.request_id,tuple(trips),final,False,"late")
         return ShuttlePlan(req.request_id,tuple(trips),final,True)
 
-    def commit(self,plan:ShuttlePlan)->Decision:
+    def commit(self,plan:ShuttlePlan,now:datetime|None=None)->Decision:
         if not plan.feasible:return Decision(False,"infeasible",plan.reason)
+        existing=self.plans.get(plan.request_id)
+        if existing is not None:
+            if existing==plan:return Decision(True,"ok","shuttle plan already committed",{"arrival":plan.final_arrival})
+            return Decision(False,"request-replanned","request already holds another plan")
+        moment=utc(now) if now is not None else None
+        first_start=min((t.outbound.start for t in plan.trips),default=None)
+        if moment is not None and first_start is not None and first_start<=moment:
+            return Decision(False,"plan-stale","plan window already started; replan against current time")
         staged=[]
         battery={bid:b.battery_pct for bid,b in self.buses.items()}
         for trip in plan.trips:
             full=Window(trip.outbound.start,trip.return_window.end)
+            if moment is not None and full.end<=moment:
+                return Decision(False,"plan-expired","shuttle window is in the past",{"bus":trip.bus_id})
             if any(w.overlaps(full) for w in self._use[trip.bus_id]):
                 return Decision(False,"bus-stale","bus became unavailable",{"bus":trip.bus_id})
             cost=battery[trip.bus_id]-trip.battery_after
@@ -126,6 +139,46 @@ class BusDispatcher:
             if value!=self.buses[bid].battery_pct:self.buses[bid]=replace(self.buses[bid],battery_pct=value)
         self.plans[plan.request_id]=plan
         return Decision(True,"ok","shuttle plan committed",{"arrival":plan.final_arrival})
+
+    def release(self,request_id:str,now:datetime)->Decision:
+        """Drop a committed plan and give back any bus time not yet consumed.
+
+        Expired plans (whose last trip has already ended) are simply removed:
+        historical occupancy stays on the ledger, but future holds are taken
+        off the bus so another request can use it.  Plans whose vehicle is
+        currently out cannot be released automatically.
+        """
+        now=utc(now)
+        plan=self.plans.pop(request_id,None)
+        if plan is None:return Decision(False,"unknown-plan","no committed plan for request",{"request":request_id})
+        freed=[]
+        for trip in plan.trips:
+            full=Window(trip.outbound.start,trip.return_window.end)
+            if full.start<=now<full.end:
+                self.plans[request_id]=plan
+                return Decision(False,"bus-en-route","bus already serving the request",{"bus":trip.bus_id})
+            if full.end<=now:continue
+            if full in self._use[trip.bus_id]:
+                self._use[trip.bus_id].remove(full)
+                freed.append(trip.bus_id)
+        return Decision(True,"ok","shuttle plan released",{"buses":tuple(sorted(set(freed)))})
+
+    def expire(self,now:datetime)->tuple[str,...]:
+        """Sweep committed plans whose transport window has fully elapsed.
+
+        Returns the request ids that were retired.  Expired plans must not
+        keep holding a bus; past windows cannot conflict with future trips,
+        but retiring them keeps commit/release state consistent with one
+        clock and prevents replays from being treated as live reservations.
+        """
+        now=utc(now)
+        retired=[]
+        for request_id,plan in tuple(self.plans.items()):
+            last_end=max((t.return_window.end for t in plan.trips),default=None)
+            if last_end is not None and last_end<=now:
+                del self.plans[request_id]
+                retired.append(request_id)
+        return tuple(sorted(retired))
 
     def charge(self,bus_id:str,window:Window)->Bus:
         if any(w.overlaps(window) for w in self._use[bus_id]):raise RuntimeError("bus busy during charge")

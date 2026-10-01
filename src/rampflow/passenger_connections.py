@@ -72,8 +72,11 @@ class ConnectionManager:
 
     def effective_minimum(self, connection: Connection) -> int:
         transfer = 0 if connection.same_terminal else self.terminal_change_min
-        supplemental = max(connection.assistance_min, transfer)
-        return connection.minimum_connect_min + supplemental
+        # Special-assistance handling time is spent on top of any terminal
+        # transfer; taking the max of the two silently drops assistance time
+        # when a terminal change is longer, which is exactly how tight
+        # assisted connections were reported as makeable.
+        return connection.minimum_connect_min + transfer + connection.assistance_min
 
     def margin_minutes(self, connection: Connection) -> int:
         inbound = self.flight_arrivals.get(
@@ -87,7 +90,7 @@ class ConnectionManager:
         raw = int((outbound - inbound).total_seconds() // 60)
         return raw - self.effective_minimum(connection)
 
-    def evaluate(self, connection: Connection) -> Connection:
+    def evaluate(self, connection: Connection, now: datetime | None = None) -> Connection:
         margin = self.margin_minutes(connection)
         outbound = self.flight_departures.get(
             connection.outbound_flight,
@@ -97,7 +100,14 @@ class ConnectionManager:
         if margin >= 0:
             state = ConnectionState.COMPLETED if connection.state == ConnectionState.COMPLETED else ConnectionState.PLANNED
         elif protected is not None and outbound <= protected:
-            state = ConnectionState.PROTECTED
+            # A hold that has already expired cannot keep a connection
+            # protected; evaluations must be made against one clock.
+            if now is not None and utc(now) > protected:
+                state = ConnectionState.MISCONNECTED
+            else:
+                state = ConnectionState.PROTECTED
+        elif now is not None and utc(now) >= outbound:
+            state = ConnectionState.MISCONNECTED
         else:
             state = ConnectionState.AT_RISK
         return replace(connection, state=state, version=connection.version + 1)
@@ -108,6 +118,7 @@ class ConnectionManager:
         *,
         onblock: datetime | None = None,
         offblock: datetime | None = None,
+        now: datetime | None = None,
     ) -> tuple[Connection, ...]:
         if onblock is not None:
             self.flight_arrivals[flight_id] = utc(onblock)
@@ -117,7 +128,7 @@ class ConnectionManager:
         for key, connection in tuple(self.connections.items()):
             if flight_id not in {connection.inbound_flight, connection.outbound_flight}:
                 continue
-            updated = self.evaluate(connection)
+            updated = self.evaluate(connection, now=now)
             self.connections[key] = updated
             changed.append(updated)
         return tuple(changed)
