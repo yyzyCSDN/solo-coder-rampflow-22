@@ -102,9 +102,16 @@ class ResourceDispatcher:
             return None
         distance = self.graph.distance(resource.location, request.location)
         travel_seconds = int(distance / resource.speed_m_s)
-        depart = request.earliest - timedelta(seconds=travel_seconds)
+        # The resource cannot leave before it is free again; a shuttle that is
+        # only available a few minutes from now must not be offered earlier.
+        # Otherwise ``plan`` would advertise an arrival that ``commit`` then
+        # rejects as "resource became busy".
+        depart = max(
+            request.earliest - timedelta(seconds=travel_seconds),
+            resource.available_at,
+        )
         arrive = depart + timedelta(seconds=travel_seconds)
-        start = max(arrive, request.earliest)
+        start = max(arrive, request.earliest, resource.available_at)
         service = Window(start, start + timedelta(minutes=request.service_min))
         if service.end > request.latest_finish:
             return None

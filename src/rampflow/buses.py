@@ -57,16 +57,61 @@ class BusDispatcher:
         self.buses={b.bus_id:b for b in buses}
         self._use:dict[str,list[Window]]={b:[] for b in self.buses}
         self.plans:dict[str,ShuttlePlan]={}
+        self._requests:dict[str,ShuttleRequest]={}
+        self._planned_requests:dict[str,ShuttleRequest]={}
 
     def _energy_cost(self,travel_min:int,dwell_min:int)->float:
         return travel_min*0.55+dwell_min*0.08
 
-    def _next_free(self,bus_id:str,at:datetime)->datetime:
+    def _trip_window(self,trip:ShuttleTrip)->Window:
+        return Window(trip.outbound.start,trip.return_window.end)
+
+    def expire_before(self,now:datetime)->tuple[str,...]:
+        """Release committed plans whose service deadline has passed.
+
+        A plan is stale once ``now`` reaches its request's ``latest_arrival``:
+        it can no longer get the passenger to the connection, so continuing to
+        block its buses only strands later requests.  Returns the released
+        request ids.
+        """
+        now=utc(now)
+        stale=tuple(
+            rid for rid,req in self._requests.items()
+            if now>=req.latest_arrival
+        )
+        for rid in stale:
+            self.cancel(rid)
+        return stale
+
+    def cancel(self,request_id:str)->bool:
+        """Drop a committed plan and give its buses/energy back.
+
+        Used both for explicit rebooking decisions and for expiry: a stale or
+        superseded shuttle plan must keep holding neither the bus nor charge.
+        """
+        plan=self.plans.pop(request_id,None)
+        req=self._requests.pop(request_id,None)
+        self._planned_requests.pop(request_id,None)
+        if plan is None:return False
+        for trip in plan.trips:
+            full=self._trip_window(trip)
+            self._use[trip.bus_id]=[w for w in self._use[trip.bus_id] if w!=full]
+        if req is not None:
+            refund=self._energy_cost(req.travel_min*2,req.dwell_min*2)
+            per_bus:dict[str,int]={}
+            for trip in plan.trips:
+                per_bus[trip.bus_id]=per_bus.get(trip.bus_id,0)+1
+            for bid,count in per_bus.items():
+                b=self.buses[bid]
+                self.buses[bid]=replace(b,battery_pct=min(100.0,b.battery_pct+refund*count))
+        return True
+
+    def _next_free(self,windows:list[Window],at:datetime)->datetime:
         cur=at
         changed=True
         while changed:
             changed=False
-            for w in sorted(self._use[bus_id],key=lambda x:x.start):
+            for w in sorted(windows,key=lambda x:x.start):
                 if w.start<=cur<w.end:
                     cur=w.end;changed=True
         return cur
@@ -81,9 +126,7 @@ class BusDispatcher:
         while remaining>0:
             options=[]
             for bid,b in virtual.items():
-                start=req.ready_at
-                for w in sorted(virtual_use[bid],key=lambda x:x.start):
-                    if w.start<=start<w.end:start=w.end
+                start=self._next_free(virtual_use[bid],req.ready_at)
                 acc=min(accessible,b.accessible_spaces)
                 cap=b.capacity(acc)
                 if cap<=0:continue
@@ -106,14 +149,19 @@ class BusDispatcher:
         final=max(t.outbound.end for t in trips)
         if final>req.latest_arrival:
             return ShuttlePlan(req.request_id,tuple(trips),final,False,"late")
-        return ShuttlePlan(req.request_id,tuple(trips),final,True)
+        plan=ShuttlePlan(req.request_id,tuple(trips),final,True)
+        self._planned_requests[req.request_id]=req
+        return plan
 
-    def commit(self,plan:ShuttlePlan)->Decision:
+    def commit(self,plan:ShuttlePlan,request:ShuttleRequest|None=None)->Decision:
         if not plan.feasible:return Decision(False,"infeasible",plan.reason)
+        if plan.request_id in self.plans and self.plans[plan.request_id]==plan:
+            return Decision(True,"ok","shuttle plan committed",{"arrival":plan.final_arrival})
+        req=request or self._planned_requests.get(plan.request_id)
         staged=[]
         battery={bid:b.battery_pct for bid,b in self.buses.items()}
         for trip in plan.trips:
-            full=Window(trip.outbound.start,trip.return_window.end)
+            full=self._trip_window(trip)
             if any(w.overlaps(full) for w in self._use[trip.bus_id]):
                 return Decision(False,"bus-stale","bus became unavailable",{"bus":trip.bus_id})
             cost=battery[trip.bus_id]-trip.battery_after
@@ -125,6 +173,7 @@ class BusDispatcher:
         for bid,value in battery.items():
             if value!=self.buses[bid].battery_pct:self.buses[bid]=replace(self.buses[bid],battery_pct=value)
         self.plans[plan.request_id]=plan
+        if req is not None:self._requests[plan.request_id]=req
         return Decision(True,"ok","shuttle plan committed",{"arrival":plan.final_arrival})
 
     def charge(self,bus_id:str,window:Window)->Bus:

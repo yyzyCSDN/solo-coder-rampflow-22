@@ -71,9 +71,23 @@ class ConnectionManager:
         self.connections[key] = connection
 
     def effective_minimum(self, connection: Connection) -> int:
-        transfer = 0 if connection.same_terminal else self.terminal_change_min
-        supplemental = max(connection.assistance_min, transfer)
-        return connection.minimum_connect_min + supplemental
+        return self.required_minutes(
+            connection, self._transfer_minutes(connection)
+        )
+
+    def required_minutes(self, connection: Connection, terminal_change_min: int = 0) -> int:
+        # Service time shared by every evaluation path: the published minimum
+        # connection plus special-assistance handling.  Special assistance is
+        # additive -- it is needed in addition to whatever walking/transfer
+        # the routing requires, never instead of it.
+        return (
+            connection.minimum_connect_min
+            + connection.assistance_min
+            + terminal_change_min
+        )
+
+    def _transfer_minutes(self, connection: Connection) -> int:
+        return 0 if connection.same_terminal else self.terminal_change_min
 
     def margin_minutes(self, connection: Connection) -> int:
         inbound = self.flight_arrivals.get(
@@ -85,7 +99,9 @@ class ConnectionManager:
             connection.outbound_offblock,
         )
         raw = int((outbound - inbound).total_seconds() // 60)
-        return raw - self.effective_minimum(connection)
+        return raw - self.required_minutes(
+            connection, self._transfer_minutes(connection)
+        )
 
     def evaluate(self, connection: Connection) -> Connection:
         margin = self.margin_minutes(connection)
@@ -167,9 +183,9 @@ class ConnectionManager:
             if option.seats <= 0:
                 continue
             earliest = inbound + timedelta(
-                minutes=connection.minimum_connect_min
-                + connection.assistance_min
-                + option.terminal_change_min
+                minutes=self.required_minutes(
+                    connection, option.terminal_change_min
+                )
             )
             if option.departure < earliest:
                 continue

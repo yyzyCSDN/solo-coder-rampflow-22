@@ -70,6 +70,9 @@ class ConnectionManager:
         if c.mobility_passengers:total+=r.mobility_extra_min
         return total
 
+    def _mobility_extra(self,c:Connection)->int:
+        return self._rule(c).mobility_extra_min if c.mobility_passengers else 0
+
     def status(self,c:Connection,gate_in_delay_min:int=0,gate_out_delay_min:int=0)->Decision:
         arrival=c.arrival+timedelta(minutes=gate_in_delay_min)
         departure=c.departure+timedelta(minutes=gate_out_delay_min)
@@ -93,7 +96,13 @@ class ConnectionManager:
             if dep<=now:continue
             if opt.seats<c.passengers:continue
             transfer=self.transfer.get((c.inbound_terminal,opt.terminal),0 if c.inbound_terminal==opt.terminal else 15)
-            ready=max(now,c.arrival)+timedelta(minutes=transfer+(opt.baggage_retag_min if c.checked_bags else 0))
+            r=self._rule(c)
+            # Same service clock as status()/required_minutes(): base minimum,
+            # security/border and mobility handling all still apply on the
+            # replacement flight; only the walking target and baggage work
+            # change (re-tagging instead of the original connection transfer).
+            extras=r.security_min+r.border_min+self._mobility_extra(c)+(opt.baggage_retag_min if c.checked_bags else 0)
+            ready=max(now,c.arrival)+timedelta(minutes=r.minimum_min+transfer+extras)
             if ready>dep:continue
             overnight=dep.date()!=c.departure.date()
             candidates.append((overnight,dep,opt.flight_id,opt))
